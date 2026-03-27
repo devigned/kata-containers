@@ -552,8 +552,18 @@ impl TryFrom<BlockConfig> for DiskConfig {
         let disk_config: DiskConfig = DiskConfig {
             path: Some(blkcfg.path_on_host.as_str().into()),
             readonly: blkcfg.is_readonly,
-            num_queues: blkcfg.num_queues,
-            queue_size: blkcfg.queue_size as u16,
+            // CH requires num_queues >= 1 and queue_size >= 2 for hot-plugged
+            // disks. Use sensible defaults when not explicitly set.
+            num_queues: if blkcfg.num_queues > 0 {
+                blkcfg.num_queues
+            } else {
+                1
+            },
+            queue_size: if blkcfg.queue_size > 0 {
+                blkcfg.queue_size as u16
+            } else {
+                128
+            },
             image_type: ImageType::Raw,
             ..Default::default()
         };
