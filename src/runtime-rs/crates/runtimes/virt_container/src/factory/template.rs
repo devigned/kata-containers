@@ -10,6 +10,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use kata_types::config::TomlConfig;
 use nix::mount::{mount, MsFlags};
 
@@ -73,10 +74,19 @@ impl Template {
     }
 
     pub fn template_vm_exists(&self) -> bool {
-        let memory_path = self.state_path.join("memory");
-        let state_path = self.state_path.join("state");
-
-        memory_path.exists() && state_path.exists()
+        if self.config.hypervisor_name == HYPERVISOR_NAME_CH {
+            // CH vm.snapshot creates config.json, memory-ranges, and state.json.
+            // All three are required for vm.restore.
+            let config_json = self.state_path.join("config.json");
+            let memory_ranges = self.state_path.join("memory-ranges");
+            let state_json = self.state_path.join("state.json");
+            config_json.exists() && memory_ranges.exists() && state_json.exists()
+        } else {
+            // QEMU uses memory and state files
+            let memory_path = self.state_path.join("memory");
+            let state_path = self.state_path.join("state");
+            memory_path.exists() && state_path.exists()
+        }
     }
 
     pub fn prepare_template_files(&self) -> Result<()> {
@@ -118,17 +128,20 @@ impl Template {
             ));
         }
 
-        // Create memory file
-        let memory_file = self.state_path.join("memory");
-        File::create(&memory_file)
-            .context(format!("failed to create memory file: {memory_file:?}"))?;
+        // QEMU needs a pre-created memory file for shared memory mapping.
+        // CH creates its own snapshot files (config.json, memory-ranges, state.json)
+        // during vm.snapshot, so no pre-creation is needed.
+        if self.config.hypervisor_name != HYPERVISOR_NAME_CH {
+            let memory_file = self.state_path.join("memory");
+            File::create(&memory_file)
+                .context(format!("failed to create memory file: {memory_file:?}"))?;
 
-        // Verify memory file was created successfully
-        if !memory_file.exists() {
-            return Err(anyhow!(
-                "memory file {:?} does not exist after creation",
-                memory_file
-            ));
+            if !memory_file.exists() {
+                return Err(anyhow!(
+                    "memory file {:?} does not exist after creation",
+                    memory_file
+                ));
+            }
         }
 
         Ok(())
@@ -167,6 +180,8 @@ impl Template {
         vm.pause().await.context("pause template vm")?;
 
         vm.save().await.context("save template vm")?;
+
+        vm.stop().await.context("stop template vm")?;
 
         Ok(())
     }

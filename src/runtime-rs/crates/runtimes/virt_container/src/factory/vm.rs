@@ -10,6 +10,12 @@ use anyhow::{anyhow, Context, Result};
 use common::{message::Message, types::SandboxConfig, Sandbox, SandboxNetworkEnv};
 use hypervisor::device::driver::{VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_PCI};
 use hypervisor::{qemu::Qemu, Hypervisor, HYPERVISOR_QEMU};
+
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use hypervisor::{ch::CloudHypervisor, HYPERVISOR_NAME_CH};
 use kata_types::config::{
     default, Agent as AgentConfig, Hypervisor as HypervisorConfig, TomlConfig,
 };
@@ -187,7 +193,7 @@ impl TemplateVm {
         }
     }
 
-    /// Initializes the QEMU hypervisor for Kata
+    /// Initializes the hypervisor for template VM creation.
     async fn new_hypervisor(config: &VmConfig) -> Result<Arc<dyn Hypervisor>> {
         let hypervisor: Arc<dyn Hypervisor> = match config.hypervisor_name.as_str() {
             HYPERVISOR_QEMU => {
@@ -196,7 +202,16 @@ impl TemplateVm {
                     .await;
                 Arc::new(h)
             }
-            // TODO: Add support for additional hypervisors or proper error handling here.
+            #[cfg(all(
+                feature = "cloud-hypervisor",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            HYPERVISOR_NAME_CH => {
+                let h = CloudHypervisor::new();
+                h.set_hypervisor_config(config.hypervisor_config.clone())
+                    .await;
+                Arc::new(h)
+            }
             _ => return Err(anyhow!("Unsupported hypervisor {}", config.hypervisor_name)),
         };
         Ok(hypervisor)
