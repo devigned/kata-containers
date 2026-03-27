@@ -138,6 +138,9 @@ pub struct Sandbox {
     pub devcg_info: Arc<RwLock<DevicesCgroupInfo>>,
 }
 
+/// Signal sent on `sender` to request agent shutdown (e.g., DestroySandbox).
+pub const SIGNAL_SHUTDOWN: i32 = 1;
+
 impl Sandbox {
     #[instrument]
     pub fn new(logger: &Logger) -> Result<Self> {
@@ -340,6 +343,31 @@ impl Sandbox {
             ctr.destroy().await?;
         }
         Ok(())
+    }
+
+    /// Reset sandbox state after VM snapshot restore.
+    ///
+    /// Clears all per-session state from the template creation so the sandbox
+    /// can be reused cleanly. This must reset everything that could carry
+    /// stale references to the prior VM session.
+    pub fn reset_for_restore(&mut self) {
+        info!(self.logger, "resetting sandbox state for restore");
+        self.containers.clear();
+        self.container_mounts.clear();
+        self.mounts.clear();
+        self.storages.clear();
+        self.running = false;
+        self.sandbox_pidns = None;
+        self.uevent_map.clear();
+        self.uevent_watchers.clear();
+        self.pcimap.clear();
+        self.hooks = None;
+
+        // Replace OOM event channel so stale get_oom_event listeners
+        // from the snapshot don't interfere with new ones.
+        let (tx, rx) = channel::<String>(100);
+        self.event_tx = Some(tx);
+        self.event_rx = Arc::new(Mutex::new(rx));
     }
 
     #[instrument]

@@ -74,7 +74,7 @@ use crate::network::setup_guest_dns;
 use crate::passfd_io;
 use crate::pci;
 use crate::random;
-use crate::sandbox::{Sandbox, SandboxError};
+use crate::sandbox::{Sandbox, SandboxError, SIGNAL_SHUTDOWN};
 use crate::storage::{add_storages, update_ephemeral_mounts, STORAGE_HANDLERS};
 use crate::util;
 use crate::version::{AGENT_VERSION, API_VERSION};
@@ -1328,6 +1328,10 @@ impl agent_ttrpc::AgentService for AgentService {
         {
             let mut s = self.sandbox.lock().await;
 
+            // Clear stale state from a prior session (e.g., after VM snapshot
+            // restore). This is safe to call on fresh sandboxes too.
+            s.reset_for_restore();
+
             let _ = fs::remove_dir_all(CONTAINER_BASE);
             let _ = fs::create_dir_all(CONTAINER_BASE);
 
@@ -1397,7 +1401,7 @@ impl agent_ttrpc::AgentService for AgentService {
                 ttrpc::Code::INTERNAL,
                 "failed to get sandbox sender channel",
             )?
-            .send(1)
+            .send(SIGNAL_SHUTDOWN)
             .map_ttrpc_err(same)?;
 
         Ok(Empty::new())

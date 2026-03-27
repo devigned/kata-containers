@@ -184,37 +184,55 @@ impl RootFsResource {
                         }
                     };
 
-                    // Create a Mount that looks like a block file rootfs so
-                    // BlockRootfs handles the hot-plug and agent storage setup.
-                    let erofs_mount = Mount {
-                        source: erofs_path.to_string_lossy().to_string(),
-                        fs_type: "erofs".to_string(),
-                        options: vec!["ro".to_string()],
-                        ..Default::default()
-                    };
-
-                    // Use st_ino as a unique identifier for the device manager,
-                    // matching the convention in is_block_rootfs() for regular
-                    // files (not actual device numbers).
-                    let fstat = nix::sys::stat::stat(erofs_path.to_str().unwrap())
-                        .context("stat erofs image")?;
-
-                    // Use a guest-local mount point that doesn't require virtiofs.
-                    // The agent will mount the erofs block device at this path.
                     let guest_rootfs_path = format!("/run/kata-rootfs/{cid}");
 
-                    let block_rootfs: Arc<dyn Rootfs> = Arc::new(
-                        block_rootfs::BlockRootfs::new_with_guest_path(
-                            device_manager,
-                            cid,
-                            fstat.st_ino,
-                            &erofs_mount,
-                            &guest_rootfs_path,
-                        )
-                        .await
-                        .context("new erofs block rootfs")?,
-                    );
-                    Ok(block_rootfs)
+                    // Try to use a pre-attached rootfs slot to avoid PCI
+                    // hot-plug latency (~124ms). Falls back to hot-plug if
+                    // no slots are available.
+                    if let Some((_disk_id, guest_device_path)) = h.allocate_rootfs_slot().await {
+                        info!(
+                            sl!(),
+                            "using pre-attached rootfs slot";
+                            "guest_device" => &guest_device_path,
+                            "erofs_path" => erofs_path.display().to_string(),
+                        );
+
+                        let block_rootfs: Arc<dyn Rootfs> = Arc::new(
+                            block_rootfs::BlockRootfs::new_preattached(
+                                cid,
+                                &guest_device_path,
+                                &guest_rootfs_path,
+                                "erofs",
+                            ),
+                        );
+                        Ok(block_rootfs)
+                    } else {
+                        // Fallback: hot-plug the erofs image as a new block device.
+                        info!(sl!(), "no pre-attached slots, falling back to hot-plug");
+
+                        let erofs_mount = Mount {
+                            source: erofs_path.to_string_lossy().to_string(),
+                            fs_type: "erofs".to_string(),
+                            options: vec!["ro".to_string()],
+                            ..Default::default()
+                        };
+
+                        let fstat = nix::sys::stat::stat(erofs_path.to_str().unwrap())
+                            .context("stat erofs image")?;
+
+                        let block_rootfs: Arc<dyn Rootfs> = Arc::new(
+                            block_rootfs::BlockRootfs::new_with_guest_path(
+                                device_manager,
+                                cid,
+                                fstat.st_ino,
+                                &erofs_mount,
+                                &guest_rootfs_path,
+                            )
+                            .await
+                            .context("new erofs block rootfs")?,
+                        );
+                        Ok(block_rootfs)
+                    }
                 } else {
                     Err(anyhow!("unsupported rootfs {:?}", &layer))
                 }?;
