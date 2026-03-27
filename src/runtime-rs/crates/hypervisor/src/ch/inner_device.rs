@@ -559,7 +559,8 @@ impl TryFrom<BlockConfig> for DiskConfig {
             } else {
                 1
             },
-            queue_size: if blkcfg.queue_size > 0 {
+            // CH requires queue_size >= 2 for hot-plugged disks
+            queue_size: if blkcfg.queue_size >= 2 {
                 blkcfg.queue_size as u16
             } else {
                 128

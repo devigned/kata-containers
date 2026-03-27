@@ -148,7 +148,12 @@ impl ResourceManagerInner {
         for dc in device_configs {
             match dc {
                 ResourceConfig::ShareFs(c) => {
-                    self.share_fs = if self
+                    self.share_fs = if share_fs::is_shared_fs_disabled(&c) {
+                        // shared_fs = "none" — skip virtio-fs entirely.
+                        // Used for template restore where erofs block devices
+                        // replace virtio-fs for container rootfs delivery.
+                        None
+                    } else if self
                         .hypervisor
                         .capabilities()
                         .await?

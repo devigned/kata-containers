@@ -6,6 +6,7 @@
 
 mod nydus_rootfs;
 mod share_fs_rootfs;
+pub mod erofs_rootfs;
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -144,6 +145,76 @@ impl RootFsResource {
                         )
                     };
                     Ok(share_rootfs)
+                } else if layer.fs_type == TYPE_OVERLAY_FS {
+                    // No shared filesystem available (e.g., template restore with
+                    // shared_fs=none). Convert the overlay rootfs to an erofs image
+                    // and hot-plug it as a read-only block device. This avoids
+                    // virtio-fs entirely, which is incompatible with VM snapshot
+                    // restore (both vhost-user reconnection and FUSE operations
+                    // hang with hot-added devices).
+                    info!(sl!(), "converting overlay rootfs to erofs block device");
+
+                    let rootfs_path = std::path::Path::new(bundle_path).join(ROOTFS);
+                    // Mount the overlay at the bundle rootfs path first
+                    layer
+                        .mount(&rootfs_path)
+                        .context("mount overlay for erofs conversion")?;
+
+                    // Build cache key from source AND mount options to avoid
+                    // collisions — overlay mounts share the same source string
+                    // ("overlay") but differ in lowerdir/upperdir/workdir.
+                    let mut key_material = layer.source.clone();
+                    if !layer.options.is_empty() {
+                        key_material.push('|');
+                        key_material.push_str(&layer.options.join(","));
+                    }
+                    let cache_key = erofs_rootfs::stable_cache_key(&key_material);
+                    let erofs_path = match erofs_rootfs::prepare_erofs(&rootfs_path, &cache_key) {
+                        Ok(path) => {
+                            if let Err(e) = nix::mount::umount(&rootfs_path) {
+                                warn!(sl!(), "failed to unmount overlay after erofs conversion: {}", e);
+                            }
+                            path
+                        }
+                        Err(e) => {
+                            if let Err(ue) = nix::mount::umount(&rootfs_path) {
+                                warn!(sl!(), "failed to unmount overlay after erofs error: {}", ue);
+                            }
+                            return Err(e).context("prepare erofs image");
+                        }
+                    };
+
+                    // Create a Mount that looks like a block file rootfs so
+                    // BlockRootfs handles the hot-plug and agent storage setup.
+                    let erofs_mount = Mount {
+                        source: erofs_path.to_string_lossy().to_string(),
+                        fs_type: "erofs".to_string(),
+                        options: vec!["ro".to_string()],
+                        ..Default::default()
+                    };
+
+                    // Use st_ino as a unique identifier for the device manager,
+                    // matching the convention in is_block_rootfs() for regular
+                    // files (not actual device numbers).
+                    let fstat = nix::sys::stat::stat(erofs_path.to_str().unwrap())
+                        .context("stat erofs image")?;
+
+                    // Use a guest-local mount point that doesn't require virtiofs.
+                    // The agent will mount the erofs block device at this path.
+                    let guest_rootfs_path = format!("/run/kata-rootfs/{cid}");
+
+                    let block_rootfs: Arc<dyn Rootfs> = Arc::new(
+                        block_rootfs::BlockRootfs::new_with_guest_path(
+                            device_manager,
+                            cid,
+                            fstat.st_ino,
+                            &erofs_mount,
+                            &guest_rootfs_path,
+                        )
+                        .await
+                        .context("new erofs block rootfs")?,
+                    );
+                    Ok(block_rootfs)
                 } else {
                     Err(anyhow!("unsupported rootfs {:?}", &layer))
                 }?;
