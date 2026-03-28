@@ -78,6 +78,15 @@ pub struct CloudHypervisorInner {
     pub(crate) guest_memory_block_size_mb: u32,
 
     pub(crate) exit_notify: Option<mpsc::Sender<i32>>,
+
+    /// Set when this VM was acquired from a pre-warmed pool.
+    /// start_vm() skips boot/restore since the VM is already running.
+    pub(crate) pool_vm_ready: bool,
+
+    /// Set when this VM was restored from a per-image snapshot that
+    /// already has the container rootfs disk attached. handler_rootfs
+    /// skips erofs conversion + hot-plug.
+    pub(crate) rootfs_preattached: bool,
 }
 
 const CH_DEFAULT_TIMEOUT_SECS: u32 = 10;
@@ -120,6 +129,8 @@ impl CloudHypervisorInner {
             guest_memory_block_size_mb: 0,
 
             exit_notify,
+            pool_vm_ready: false,
+            rootfs_preattached: false,
         }
     }
 

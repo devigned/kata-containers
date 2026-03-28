@@ -137,4 +137,14 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn set_guest_memory_block_size(&self, size: u32);
     async fn guest_memory_block_size(&self) -> u32;
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)>;
+
+    /// Check if the container rootfs is already attached from a per-image snapshot.
+    async fn is_rootfs_preattached(&self) -> bool {
+        false
+    }
+
+    /// Check if this VM was acquired from a pool (devices already configured).
+    async fn is_pool_vm(&self) -> bool {
+        false
+    }
 }
