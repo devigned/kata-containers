@@ -52,11 +52,13 @@ impl BlockRootfs {
 
         let blkdev_info = get_block_device_info(d).await;
         let block_driver = blkdev_info.block_device_driver.clone();
+        let is_readonly = rootfs.options.iter().any(|o| o == "ro");
         let block_device_config = &mut BlockConfig {
             major: stat::major(dev_id) as i64,
             minor: stat::minor(dev_id) as i64,
             driver_option: block_driver.clone(),
             path_on_host: rootfs.source.clone(),
+            is_readonly,
             blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
             ..Default::default()
         };
@@ -120,6 +122,69 @@ impl BlockRootfs {
 
         Ok(Self {
             guest_path: container_path.clone(),
+            device_id,
+            mount: oci::Mount::default(),
+            storage: Some(storage),
+        })
+    }
+
+    /// Create a BlockRootfs with an explicit guest mount path.
+    ///
+    /// Used for erofs rootfs where the guest path doesn't depend on virtiofs
+    /// shared directories.
+    pub async fn new_with_guest_path(
+        d: &RwLock<DeviceManager>,
+        cid: &str,
+        dev_id: u64,
+        rootfs: &Mount,
+        guest_path: &str,
+    ) -> Result<Self> {
+        let blkdev_info = get_block_device_info(d).await;
+        let block_driver = blkdev_info.block_device_driver.clone();
+        let is_readonly = rootfs.options.iter().any(|o| o == "ro");
+        let block_device_config = &mut BlockConfig {
+            major: stat::major(dev_id) as i64,
+            minor: stat::minor(dev_id) as i64,
+            driver_option: block_driver.clone(),
+            path_on_host: rootfs.source.clone(),
+            is_readonly,
+            blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
+            ..Default::default()
+        };
+
+        let device_info = do_handle_device(d, &DeviceConfig::BlockCfg(block_device_config.clone()))
+            .await
+            .context("do handle device failed.")?;
+
+        let mut storage = Storage {
+            fs_type: rootfs.fs_type.clone(),
+            mount_point: guest_path.to_string(),
+            options: rootfs.options.clone(),
+            ..Default::default()
+        };
+
+        let mut device_id: String = "".to_owned();
+        if let DeviceType::Block(device) = device_info {
+            storage.driver = device.config.driver_option;
+            device_id = device.device_id;
+
+            match block_driver.as_str() {
+                VIRTIO_BLK_PCI => {
+                    storage.source = device
+                        .config
+                        .pci_path
+                        .ok_or("PCI path missing for pci block device")
+                        .map_err(|e| anyhow!(e))?
+                        .to_string();
+                }
+                _ => {
+                    storage.source = device.config.virt_path;
+                }
+            }
+        }
+
+        Ok(Self {
+            guest_path: guest_path.to_string(),
             device_id,
             mount: oci::Mount::default(),
             storage: Some(storage),

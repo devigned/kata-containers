@@ -540,3 +540,22 @@ sandbox_bind_mounts = @DEFBINDMOUNTS@
 # to the hypervisor.
 # (default: /run/kata-containers/dans)
 dan_conf = "@DEFDANCONF@"
+
+[hypervisor.cloud-hypervisor.factory]
+# VM templating support. Once enabled, new VMs are created from a snapshot
+# taken at runtime startup. Subsequent container VMs are restored from this
+# snapshot using Cloud Hypervisor's vm.restore API with OnDemand memory
+# restore mode, which uses userfaultfd to lazily fault pages in on first
+# access instead of eagerly copying the entire snapshot into guest RAM.
+# This significantly reduces VM creation latency and memory footprint.
+#
+# Note: Requires a Cloud Hypervisor build from the main branch (post PR #7800)
+# that includes userfaultfd-based demand-paged snapshot restore support.
+#
+# Default false
+enable_template = false
+
+# Specifies the path of template.
+#
+# Default "/run/vc/vm/template"
+template_path = "/run/vc/vm/template"
