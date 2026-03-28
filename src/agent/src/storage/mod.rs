@@ -84,6 +84,13 @@ impl StorageDevice for StorageDeviceGeneric {
             return Ok(());
         }
 
+        // Clean up erofs overlayfs lower mount if present (see mount_erofs_overlayfs)
+        let overlay_lower = Path::new(path).with_extension("overlay").join("lower");
+        if overlay_lower.exists() {
+            let _ = nix::mount::umount(&overlay_lower);
+            let _ = fs::remove_dir_all(Path::new(path).with_extension("overlay"));
+        }
+
         if matches!(is_mounted(path), Ok(true)) {
             let mounts = vec![path.to_string()];
             remove_mounts(&mounts)?;
@@ -275,6 +282,14 @@ fn mount_storage(logger: &Logger, storage: &Storage) -> Result<()> {
         return Ok(());
     }
 
+    // For erofs filesystems, mount as the lower layer of an overlayfs with
+    // a tmpfs upper layer. This provides a writable layer on top of the
+    // immutable erofs image, allowing the container runtime to create
+    // directories like /proc, /sys, /dev as mount points.
+    if storage.fstype == "erofs" {
+        return mount_erofs_overlayfs(&logger, storage);
+    }
+
     let (flags, options) = parse_mount_options(&storage.options)?;
     let mount_path = Path::new(&storage.mount_point);
     let src_path = Path::new(&storage.source);
@@ -296,6 +311,84 @@ fn mount_storage(logger: &Logger, storage: &Storage) -> Result<()> {
         options.as_str(),
         &logger,
     )
+}
+
+/// Mount an erofs block device as the lower layer of an overlayfs.
+///
+/// The erofs image is immutable (read-only). To support container runtimes
+/// that need to create directories (e.g., /proc, /sys mount points) in the
+/// rootfs, we compose an overlayfs with:
+///   - lowerdir: the erofs mount (read-only)
+///   - upperdir: a writable directory under a temporary overlay base
+///   - workdir:  a writable directory under the same overlay base
+///
+/// This follows the containerd-cloudhypervisor architecture where erofs
+/// images replace virtio-fs for container rootfs delivery after VM snapshot
+/// restore.
+///
+/// Cleanup: Both the erofs lower mount and the overlayfs mount are cleaned up
+/// by `StorageDeviceGeneric::cleanup()`, which unmounts `<mount_point>.overlay/lower`
+/// before unmounting the main mount point.
+fn mount_erofs_overlayfs(logger: &Logger, storage: &Storage) -> Result<()> {
+    let mount_point = Path::new(&storage.mount_point);
+    let src_path = Path::new(&storage.source);
+
+    std::fs::create_dir_all(mount_point)
+        .with_context(|| format!("create mount point {:?}", mount_point))?;
+
+    // Create directories for the erofs mount and overlayfs upper/work dirs.
+    // These live under <mount_point>.overlay/ alongside the final mount.
+    let overlay_base = mount_point.with_extension("overlay");
+    let erofs_dir = overlay_base.join("lower");
+    let upper_dir = overlay_base.join("upper");
+    let work_dir = overlay_base.join("work");
+
+    std::fs::create_dir_all(&erofs_dir)?;
+    std::fs::create_dir_all(&upper_dir)?;
+    std::fs::create_dir_all(&work_dir)?;
+
+    // Mount the erofs block device read-only
+    info!(logger, "mounting erofs lower layer";
+        "source" => src_path.display(),
+        "dest" => erofs_dir.display(),
+    );
+    baremount(
+        src_path,
+        &erofs_dir,
+        "erofs",
+        nix::mount::MsFlags::MS_RDONLY | nix::mount::MsFlags::MS_NOATIME,
+        "",
+        logger,
+    )
+    .context("mount erofs lower layer")?;
+
+    // Compose overlayfs
+    let overlay_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        erofs_dir.display(),
+        upper_dir.display(),
+        work_dir.display()
+    );
+
+    info!(logger, "mounting erofs overlayfs";
+        "mount-point" => mount_point.display(),
+        "options" => &overlay_opts,
+    );
+
+    if let Err(e) = baremount(
+        Path::new("overlay"),
+        mount_point,
+        "overlay",
+        nix::mount::MsFlags::empty(),
+        &overlay_opts,
+        logger,
+    ) {
+        // Clean up the erofs lower mount on failure
+        let _ = nix::mount::umount(&erofs_dir);
+        return Err(e).context("mount erofs overlayfs");
+    }
+
+    Ok(())
 }
 
 #[instrument]

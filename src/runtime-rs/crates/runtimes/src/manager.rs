@@ -468,6 +468,9 @@ impl RuntimeHandlerManager {
                 annotations: spec.annotations().clone().unwrap_or_default(),
             };
 
+            // Pass rootfs mount info to the pool daemon for per-image snapshot lookup.
+            virt_container::set_pending_rootfs(container_config.rootfs_mounts.clone());
+
             self.task_init_runtime_instance(&mut spec, &state, &container_config.options)
                 .await
                 .context("try init runtime instance")?;

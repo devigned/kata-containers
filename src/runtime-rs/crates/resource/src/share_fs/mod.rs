@@ -168,3 +168,11 @@ pub fn new(id: &str, config: &SharedFsInfo) -> Result<Arc<dyn ShareFs>> {
         _ => Err(anyhow!("unsupported shred fs {:?}", &shared_fs)),
     }
 }
+
+/// Check if shared_fs is disabled (set to "none").
+pub fn is_shared_fs_disabled(config: &SharedFsInfo) -> bool {
+    config
+        .shared_fs
+        .as_deref()
+        .map_or(false, |s| s == "none")
+}
