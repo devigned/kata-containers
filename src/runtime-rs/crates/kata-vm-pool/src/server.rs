@@ -61,6 +61,7 @@ async fn handle_connection(
 
         let response = match action {
             "acquire" => handle_acquire(&pool, &request).await,
+            "run_container" => handle_run_container(&pool, &request).await,
             "release" => {
                 let vm_id = request
                     .get("vm_id")
@@ -99,6 +100,23 @@ async fn handle_acquire(pool: &Arc<Pool>, request: &serde_json::Value) -> serde_
 async fn handle_release(pool: &Pool, vm_id: &str) -> serde_json::Value {
     match pool.release(vm_id).await {
         Ok(()) => serde_json::json!({"ok": true}),
+        Err(e) => serde_json::json!({"error": format!("{:#}", e)}),
+    }
+}
+
+/// Run a container in a pool VM: acquire VM, hot-plug erofs, create sandbox,
+/// create container — all in the daemon. Returns VM info + container PID.
+async fn handle_run_container(pool: &Arc<Pool>, request: &serde_json::Value) -> serde_json::Value {
+    let erofs_path = request.get("erofs_path").and_then(|v| v.as_str()).unwrap_or("");
+    let container_id = request.get("container_id").and_then(|v| v.as_str()).unwrap_or("");
+    let sandbox_id = request.get("sandbox_id").and_then(|v| v.as_str()).unwrap_or("");
+
+    if erofs_path.is_empty() || container_id.is_empty() {
+        return serde_json::json!({"error": "erofs_path and container_id required"});
+    }
+
+    match pool.run_container(erofs_path, container_id, sandbox_id).await {
+        Ok(result) => result,
         Err(e) => serde_json::json!({"error": format!("{:#}", e)}),
     }
 }

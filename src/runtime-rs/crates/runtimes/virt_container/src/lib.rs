@@ -230,95 +230,74 @@ async fn acquire_from_pool(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    // Compute erofs path + image key from rootfs mounts so the pool daemon
-    // can check its per-image snapshot cache.
-    let mut image_key: Option<String> = None;
-    let mut erofs_path: Option<String> = None;
-
+    // Compute erofs path (cache check first, no mount if cached)
+    let mut erofs_path = String::new();
     if let Some(mounts) = rootfs_mounts {
         if let Some(layer) = mounts.first() {
             if layer.fs_type == "overlay" {
-                let probe_path = std::path::PathBuf::from(format!(
-                    "/tmp/kata-erofs-probe-{}", std::process::id()
-                ));
-                let _ = std::fs::create_dir_all(&probe_path);
-                if layer.mount(&probe_path).is_ok() {
-                    let mut key_material = layer.source.clone();
-                    if !layer.options.is_empty() {
-                        key_material.push('|');
-                        key_material.push_str(&layer.options.join(","));
-                    }
-                    let cache_key = resource::rootfs::erofs_rootfs::stable_cache_key(&key_material);
-                    if let Ok(path) = resource::rootfs::erofs_rootfs::prepare_erofs(&probe_path, &cache_key) {
-                        erofs_path = Some(path.to_string_lossy().to_string());
-                    }
-                    let _ = nix::mount::umount(&probe_path);
+                let mut key_material = layer.source.clone();
+                if !layer.options.is_empty() {
+                    key_material.push('|');
+                    key_material.push_str(&layer.options.join(","));
                 }
+                let cache_key = resource::rootfs::erofs_rootfs::stable_cache_key(&key_material);
+                let cache_file = std::path::PathBuf::from("/run/vc/erofs-cache")
+                    .join(format!("{cache_key}.erofs"));
 
-                // Use the lowerdir path as a stable image key — it contains
-                // the containerd snapshot ID which is stable per image layer.
-                // Extract lowerdir from mount options: "lowerdir=/path/to/snap/fs"
-                for opt in &layer.options {
-                    if let Some(lower) = opt.strip_prefix("lowerdir=") {
-                        image_key = Some(resource::rootfs::erofs_rootfs::stable_cache_key(lower));
-                        break;
+                if cache_file.exists() {
+                    erofs_path = cache_file.to_string_lossy().to_string();
+                } else {
+                    let probe_path = std::path::PathBuf::from(format!(
+                        "/tmp/kata-erofs-probe-{}", std::process::id()
+                    ));
+                    let _ = std::fs::create_dir_all(&probe_path);
+                    if layer.mount(&probe_path).is_ok() {
+                        if let Ok(path) = resource::rootfs::erofs_rootfs::prepare_erofs(&probe_path, &cache_key) {
+                            erofs_path = path.to_string_lossy().to_string();
+                        }
+                        let _ = nix::mount::umount(&probe_path);
                     }
                 }
             }
         }
     }
 
+    // Send run_container to daemon — it acquires a VM, hot-plugs erofs,
+    // and runs create_sandbox + create_container via the agent.
+    // This eliminates ~200ms of shim-side work (sandbox.start + create_container).
     let mut stream = UnixStream::connect(pool_socket)
         .await
         .context("connect to pool daemon")?;
 
-    // Send acquire request with image info for snapshot cache lookup
-    let mut req = serde_json::json!({"action": "acquire"});
-    if let Some(ref key) = image_key {
-        req["image_key"] = serde_json::Value::String(key.clone());
-    }
-    if let Some(ref path) = erofs_path {
-        req["erofs_path"] = serde_json::Value::String(path.clone());
-    }
+    let req = serde_json::json!({
+        "action": "run_container",
+        "erofs_path": erofs_path,
+        "container_id": "default",
+        "sandbox_id": "default",
+    });
     let mut req_bytes = serde_json::to_vec(&req)?;
     req_bytes.push(b'\n');
-    stream.write_all(&req_bytes).await.context("send acquire")?;
+    stream.write_all(&req_bytes).await.context("send run_container")?;
 
-    // Read response
     let mut reader = BufReader::new(&mut stream);
     let mut response = String::new();
-    reader
-        .read_line(&mut response)
-        .await
-        .context("read pool response")?;
+    reader.read_line(&mut response).await.context("read response")?;
 
-    let vm: serde_json::Value =
-        serde_json::from_str(&response).context("parse pool response")?;
-
+    let vm: serde_json::Value = serde_json::from_str(&response).context("parse response")?;
     if let Some(error) = vm.get("error") {
-        return Err(anyhow!("pool error: {}", error));
+        return Err(anyhow!("daemon error: {}", error));
     }
 
-    let api_socket = vm["api_socket"]
-        .as_str()
-        .ok_or_else(|| anyhow!("missing api_socket"))?;
-    let vsock_socket = vm["vsock_socket"]
-        .as_str()
-        .ok_or_else(|| anyhow!("missing vsock_socket"))?;
-    let ch_pid = vm["ch_pid"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("missing ch_pid"))? as u32;
-    let vm_id = vm["vm_id"]
-        .as_str()
-        .ok_or_else(|| anyhow!("missing vm_id"))?;
-    let rootfs_preattached = vm["rootfs_preattached"].as_bool().unwrap_or(false);
+    let api_socket = vm["api_socket"].as_str().ok_or_else(|| anyhow!("missing api_socket"))?;
+    let vsock_socket = vm["vsock_socket"].as_str().ok_or_else(|| anyhow!("missing vsock_socket"))?;
+    let ch_pid = vm["ch_pid"].as_u64().ok_or_else(|| anyhow!("missing ch_pid"))? as u32;
+    let vm_id = vm["vm_id"].as_str().ok_or_else(|| anyhow!("missing vm_id"))?;
 
-    info!(
-        sl!(),
-        "acquired pool VM: {} (PID={}, preattached={})", vm_id, ch_pid, rootfs_preattached
-    );
+    info!(sl!(), "daemon ran container in VM {} (PID={})", vm_id, ch_pid);
 
-    // Create CH hypervisor from pool VM
+    // Create hypervisor wrapper for lifecycle tracking.
+    // sandbox.start() and create_container() will be no-ops since the
+    // daemon already did the work.
     let hypervisor_config = toml_config
         .hypervisor
         .get(HYPERVISOR_NAME_CH)
@@ -326,11 +305,9 @@ async fn acquire_from_pool(
         .unwrap_or_default();
 
     let hypervisor = CloudHypervisor::new();
+    hypervisor.set_hypervisor_config(hypervisor_config).await;
     hypervisor
-        .set_hypervisor_config(hypervisor_config)
-        .await;
-    hypervisor
-        .init_from_pool(api_socket, vsock_socket, ch_pid, vm_id, rootfs_preattached)
+        .init_from_pool(api_socket, vsock_socket, ch_pid, vm_id, false)
         .await
         .context("init CH from pool")?;
 

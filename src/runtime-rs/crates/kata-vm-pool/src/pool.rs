@@ -82,53 +82,53 @@ impl Pool {
         image_key: Option<&str>,
         erofs_path: Option<&str>,
     ) -> Result<PoolVm> {
-        // Try per-image snapshot cache (warm path)
-        if let (Some(key), Some(_erofs)) = (image_key, erofs_path) {
-            // Check in-memory cache first, then disk
-            let snapshot = self.snapshot_cache.get(key).await
-                .or_async(self.snapshot_cache.load_from_disk(key)).await;
-
-            if let Some(snapshot) = snapshot {
-                tracing::info!("image snapshot cache hit for {}", key);
-                match self.restore_from_image_snapshot(&snapshot).await {
-                    Ok(vm) => {
-                        self.active.lock().await.insert(vm.vm_id.clone(), vm.clone());
-                        return Ok(vm);
-                    }
-                    Err(e) => {
-                        tracing::warn!("image snapshot restore failed, falling back to pool: {:#}", e);
-                    }
-                }
-            }
-        }
-
-        // Generic pool (cold path for this image)
-        let vm = self.ready.lock().await.pop();
-        let vm = if let Some(vm) = vm {
-            tracing::info!("acquired generic pool VM {} (instant)", vm.vm_id);
-            vm
+        // Always take a generic pre-warmed VM from the pool (instant).
+        // Shadow snapshot cache just tells us if rootfs is known for this image.
+        let has_shadow = if let Some(key) = image_key {
+            self.snapshot_cache.get(key).await.is_some()
+                || self.snapshot_cache.load_from_disk(key).await.is_some()
         } else {
-            tracing::warn!("pool empty, restoring VM synchronously");
-            self.restore_one_base().await.context("sync restore")?
+            false
         };
+
+        let mut vm = match self.ready.lock().await.pop() {
+            Some(vm) => {
+                tracing::info!("acquired pool VM {} (instant)", vm.vm_id);
+                vm
+            }
+            None => {
+                tracing::warn!("pool empty, restoring VM synchronously");
+                self.restore_one_base().await.context("sync restore")?
+            }
+        };
+
+        // If shadow cache knows this image, the erofs file is guaranteed
+        // cached on disk — handler_rootfs will find it instantly.
+        // (rootfs_preattached is future optimization for when shadow VMs
+        // are pre-warmed in the pool with rootfs already attached.)
+        if has_shadow {
+            tracing::info!("shadow cache hit — erofs cached for this image");
+        }
 
         self.active.lock().await.insert(vm.vm_id.clone(), vm.clone());
 
-        // Replenish generic pool asynchronously
+        // Replenish pool asynchronously
         let pool = Arc::clone(self);
         tokio::spawn(async move { pool.replenish_one().await });
 
-        // Trigger async shadow snapshot creation for this image
-        if let (Some(key), Some(erofs)) = (image_key, erofs_path) {
-            let cache = Arc::clone(&self.snapshot_cache);
-            let key = key.to_string();
-            let erofs = erofs.to_string();
-            let base_dir = self.config.snapshot_dir.clone();
-            tokio::spawn(async move {
-                if let Err(e) = cache.create_shadow(&key, &erofs, &base_dir).await {
-                    tracing::error!("shadow snapshot creation failed for {}: {:#}", key, e);
-                }
-            });
+        // Trigger async shadow snapshot creation on first use of this image
+        if !has_shadow {
+            if let (Some(key), Some(erofs)) = (image_key, erofs_path) {
+                let cache = Arc::clone(&self.snapshot_cache);
+                let key = key.to_string();
+                let erofs = erofs.to_string();
+                let base_dir = self.config.snapshot_dir.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = cache.create_shadow(&key, &erofs, &base_dir).await {
+                        tracing::error!("shadow snapshot creation failed for {}: {:#}", key, e);
+                    }
+                });
+            }
         }
 
         Ok(vm)
@@ -143,6 +143,73 @@ impl Pool {
             let _ = std::fs::remove_dir_all(self.config.state_dir.join(&vm.vm_id));
         }
         Ok(())
+    }
+
+    /// Run a container end-to-end: acquire VM, hot-plug erofs, agent RPCs.
+    /// Returns JSON with VM info + container result.
+    pub async fn run_container(
+        self: &Arc<Self>,
+        erofs_path: &str,
+        container_id: &str,
+        sandbox_id: &str,
+    ) -> Result<serde_json::Value> {
+        // 1. Acquire pre-warmed VM (instant from pool)
+        let vm = match self.ready.lock().await.pop() {
+            Some(vm) => {
+                tracing::info!("run_container: acquired {} (instant)", vm.vm_id);
+                vm
+            }
+            None => {
+                tracing::warn!("run_container: pool empty, restoring synchronously");
+                self.restore_one_base().await.context("sync restore")?
+            }
+        };
+
+        self.active.lock().await.insert(vm.vm_id.clone(), vm.clone());
+
+        // Replenish asynchronously
+        let pool = Arc::clone(self);
+        tokio::spawn(async move { pool.replenish_one().await });
+
+        let api_socket = PathBuf::from(&vm.api_socket);
+        let vsock_socket = PathBuf::from(&vm.vsock_socket);
+
+        // 2. Hot-plug erofs rootfs disk
+        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+        let disk_body = serde_json::json!({
+            "path": erofs_path,
+            "readonly": true,
+            "id": disk_id,
+        });
+        vm_lifecycle::api_request_pub(
+            &api_socket, "PUT", "/api/v1/vm.add-disk",
+            Some(&disk_body.to_string()),
+        ).await.context("hot-plug erofs rootfs")?;
+
+        // 3. Connect to agent (reuse warm_agent's ttrpc handshake)
+        // The agent is already listening from the pool warm-up.
+        // Send create_sandbox + create_container via raw ttrpc.
+        let sid = if sandbox_id.is_empty() { container_id } else { sandbox_id };
+
+        // CreateSandbox RPC
+        vm_lifecycle::send_agent_rpc(&vsock_socket, "CreateSandbox", sid).await
+            .context("agent CreateSandbox")?;
+
+        // CreateContainer RPC (with erofs storage)
+        vm_lifecycle::send_agent_create_container(&vsock_socket, container_id, sid).await
+            .context("agent CreateContainer")?;
+
+        // StartContainer RPC
+        vm_lifecycle::send_agent_rpc(&vsock_socket, "StartContainer", container_id).await
+            .context("agent StartContainer")?;
+
+        Ok(serde_json::json!({
+            "vm_id": vm.vm_id,
+            "api_socket": vm.api_socket,
+            "vsock_socket": vm.vsock_socket,
+            "ch_pid": vm.ch_pid,
+            "container_id": container_id,
+        }))
     }
 
     pub async fn status(&self) -> (usize, usize) {

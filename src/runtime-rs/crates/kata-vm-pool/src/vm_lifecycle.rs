@@ -339,3 +339,134 @@ async fn api_request(
     })
     .await?
 }
+
+/// Send a raw ttrpc RPC to the agent over hybrid vsock.
+/// Used by run_container to send create_sandbox/start_container.
+pub async fn send_agent_rpc(vsock_socket: &Path, method: &str, id: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(vsock_socket).await?;
+    stream.write_all(b"CONNECT 1024\n").await?;
+    let mut hdr = [0u8; 64];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read(&mut hdr),
+    ).await.map_err(|_| anyhow!("vsock handshake timeout"))??;
+    if !String::from_utf8_lossy(&hdr[..n]).contains("OK") {
+        return Err(anyhow!("vsock handshake failed"));
+    }
+
+    let service = b"grpc.AgentService";
+
+    // Build inner payload based on method
+    let inner_payload: Vec<u8> = match method {
+        "CreateSandbox" => {
+            // sandbox_id is field 5: tag 0x2a, len, value
+            let mut p = vec![0x2a, id.len() as u8];
+            p.extend_from_slice(id.as_bytes());
+            p
+        }
+        "StartContainer" | "RemoveContainer" => {
+            // container_id is field 1: tag 0x0a, len, value
+            let mut p = vec![0x0a, id.len() as u8];
+            p.extend_from_slice(id.as_bytes());
+            p
+        }
+        _ => vec![],
+    };
+
+    let method_bytes = method.as_bytes();
+    let mut req_proto = Vec::new();
+    req_proto.push(0x0a);
+    req_proto.push(service.len() as u8);
+    req_proto.extend_from_slice(service);
+    req_proto.push(0x12);
+    req_proto.push(method_bytes.len() as u8);
+    req_proto.extend_from_slice(method_bytes);
+    if !inner_payload.is_empty() {
+        req_proto.push(0x1a);
+        req_proto.push(inner_payload.len() as u8);
+        req_proto.extend_from_slice(&inner_payload);
+    }
+
+    // ttrpc frame (big endian)
+    let mut frame = Vec::with_capacity(10 + req_proto.len());
+    frame.extend_from_slice(&(req_proto.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&1u32.to_be_bytes()); // stream_id
+    frame.push(1); // type = REQUEST
+    frame.push(0); // flags
+    frame.extend_from_slice(&req_proto);
+
+    stream.write_all(&frame).await?;
+
+    let mut resp = vec![0u8; 4096];
+    match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut resp)).await {
+        Ok(Ok(n)) if n > 0 => {
+            tracing::debug!("agent {}: {}B response", method, n);
+            Ok(())
+        }
+        _ => Err(anyhow!("agent {} timeout or empty response", method)),
+    }
+}
+
+/// Send CreateContainer RPC with erofs storage entry.
+pub async fn send_agent_create_container(
+    vsock_socket: &Path,
+    container_id: &str,
+    sandbox_id: &str,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(vsock_socket).await?;
+    stream.write_all(b"CONNECT 1024\n").await?;
+    let mut hdr = [0u8; 64];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read(&mut hdr),
+    ).await.map_err(|_| anyhow!("vsock handshake timeout"))??;
+    if !String::from_utf8_lossy(&hdr[..n]).contains("OK") {
+        return Err(anyhow!("vsock handshake failed"));
+    }
+
+    let service = b"grpc.AgentService";
+    let method = b"CreateContainer";
+
+    // Minimal CreateContainerRequest: container_id (field 1) + sandbox_pidns=false
+    // The OCI spec and storages are handled by the agent from the erofs mount.
+    let mut inner = Vec::new();
+    // field 1: container_id
+    inner.push(0x0a);
+    inner.push(container_id.len() as u8);
+    inner.extend_from_slice(container_id.as_bytes());
+
+    let mut req_proto = Vec::new();
+    req_proto.push(0x0a);
+    req_proto.push(service.len() as u8);
+    req_proto.extend_from_slice(service);
+    req_proto.push(0x12);
+    req_proto.push(method.len() as u8);
+    req_proto.extend_from_slice(method);
+    req_proto.push(0x1a);
+    req_proto.push(inner.len() as u8);
+    req_proto.extend_from_slice(&inner);
+
+    let mut frame = Vec::with_capacity(10 + req_proto.len());
+    frame.extend_from_slice(&(req_proto.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&2u32.to_be_bytes()); // stream_id = 2
+    frame.push(1);
+    frame.push(0);
+    frame.extend_from_slice(&req_proto);
+
+    stream.write_all(&frame).await?;
+
+    let mut resp = vec![0u8; 4096];
+    match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut resp)).await {
+        Ok(Ok(n)) if n > 0 => {
+            tracing::debug!("agent CreateContainer: {}B response", n);
+            Ok(())
+        }
+        _ => Err(anyhow!("agent CreateContainer timeout")),
+    }
+}

@@ -117,6 +117,9 @@ pub struct Sandbox {
     pub id: String,
     pub hostname: String,
     pub containers: HashMap<String, LinuxContainer>,
+    /// Containers managed by crun (when crun feature is enabled).
+    #[cfg(feature = "crun")]
+    pub crun_containers: HashMap<String, crate::crun::CrunContainer>,
     pub network: Network,
     pub mounts: Vec<String>,
     pub container_mounts: HashMap<String, Vec<String>>,
@@ -155,6 +158,8 @@ impl Sandbox {
             hostname: String::new(),
             network: Network::new(),
             containers: HashMap::new(),
+            #[cfg(feature = "crun")]
+            crun_containers: HashMap::new(),
             mounts: Vec::new(),
             container_mounts: HashMap::new(),
             uevent_map: HashMap::new(),
@@ -291,6 +296,11 @@ impl Sandbox {
 
     pub fn add_container(&mut self, c: LinuxContainer) {
         self.containers.insert(c.id.clone(), c);
+    }
+
+    #[cfg(feature = "crun")]
+    pub fn add_crun_container(&mut self, id: String, c: crate::crun::CrunContainer) {
+        self.crun_containers.insert(id, c);
     }
 
     pub fn get_container(&mut self, id: &str) -> Option<&mut LinuxContainer> {

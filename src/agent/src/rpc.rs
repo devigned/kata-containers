@@ -285,6 +285,33 @@ impl AgentService {
         // restore the cwd for kata-agent process.
         defer!(unistd::chdir(&olddir).unwrap());
 
+        #[cfg(feature = "crun")]
+        {
+            // Use crun as the OCI runtime instead of rustjail.
+            // crun handles namespace creation, cgroup setup, pivot_root,
+            // and exec via the OCI spec. Shared namespace setup
+            // (update_shared_pidns, setup_shared_mounts) is not needed
+            // because crun reads namespace paths directly from the spec.
+            let bundle = crate::crun::prepare_bundle(&cid, &oci)?;
+            match crate::crun::CrunContainer::run(&cid, &bundle) {
+                Ok(container) => {
+                    info!(sl(), "crun container started: {} (pid={:?})", cid, container.pid);
+                    s.add_crun_container(cid.clone(), container);
+                }
+                Err(err) => {
+                    error!(sl(), "crun run failed: {:?}", err);
+                    if let Err(e) = remove_container_resources(&mut s, &cid).await {
+                        error!(sl(), "failed to remove container resources: {:?}", e);
+                    }
+                    return Err(err);
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "crun"))]
+        {
+
         // determine which cgroup driver to take and then assign to use_systemd_cgroup
         // systemd: "[slice]:[prefix]:[name]"
         // fs: "/path_a/path_b"
@@ -350,10 +377,24 @@ impl AgentService {
         info!(sl(), "created container!");
 
         Ok(())
+        } // cfg(not(feature = "crun"))
     }
 
     #[instrument]
     async fn do_start_container(&self, req: protocols::agent::StartContainerRequest) -> Result<()> {
+        let cid = req.container_id.clone();
+
+        // With crun, the container was already started by "crun run" in
+        // do_create_container. start_container is a no-op.
+        #[cfg(feature = "crun")]
+        {
+            let s = self.sandbox.lock().await;
+            if s.crun_containers.contains_key(&cid) {
+                info!(sl(), "crun container {} already running, start is a no-op", cid);
+                return Ok(());
+            }
+        }
+
         let mut s = self.sandbox.lock().await;
         let sid = s.id.clone();
         let cid = req.container_id.clone();
@@ -383,6 +424,17 @@ impl AgentService {
         req: protocols::agent::RemoveContainerRequest,
     ) -> Result<()> {
         let cid = req.container_id;
+
+        #[cfg(feature = "crun")]
+        {
+            let mut sandbox = self.sandbox.lock().await;
+            if let Some(container) = sandbox.crun_containers.remove(&cid) {
+                info!(sl(), "removing crun container {}", cid);
+                let _ = container.delete();
+                remove_container_resources(&mut sandbox, &cid).await?;
+                return Ok(());
+            }
+        }
 
         // Drop the host guest mapping for this container so we can reuse the
         // PCI slots for the next containers
@@ -467,6 +519,15 @@ impl AgentService {
             "exec-id" => &eid,
             "signal" => req.signal,
         );
+
+        #[cfg(feature = "crun")]
+        {
+            let sandbox = self.sandbox.lock().await;
+            if let Some(container) = sandbox.crun_containers.get(&cid) {
+                return container.kill(req.signal as i32)
+                    .context("crun kill");
+            }
+        }
 
         let mut sig: libc::c_int = req.signal as libc::c_int;
         {
@@ -576,6 +637,16 @@ impl AgentService {
             "container-id" => &cid,
             "exec-id" => &eid
         );
+
+        #[cfg(feature = "crun")]
+        {
+            let sandbox = self.sandbox.lock().await;
+            if let Some(container) = sandbox.crun_containers.get(&cid) {
+                let code = container.wait().unwrap_or(-1);
+                resp.status = code;
+                return Ok(resp);
+            }
+        }
 
         let pid: pid_t;
         let (exit_send, mut exit_recv) = tokio::sync::mpsc::channel(100);

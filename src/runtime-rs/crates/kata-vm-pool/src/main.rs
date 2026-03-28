@@ -51,7 +51,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            pool_size: 3,
+            pool_size: 10,
             snapshot_dir: PathBuf::from("/run/vc/vm/template"),
             image_snapshot_dir: PathBuf::from("/run/vc/vm/image-snapshots"),
             ch_path: PathBuf::from("/opt/kata/bin/cloud-hypervisor-ondemand"),
