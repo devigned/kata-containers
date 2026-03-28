@@ -190,6 +190,30 @@ impl BlockRootfs {
             storage: Some(storage),
         })
     }
+
+    /// Create a BlockRootfs for a pre-attached disk (no hot-plug needed).
+    pub fn new_preattached(
+        cid: &str,
+        guest_device_path: &str,
+        guest_mount_path: &str,
+        fs_type: &str,
+    ) -> Self {
+        let storage = agent::Storage {
+            driver: "blk".to_string(),
+            source: guest_device_path.to_string(),
+            fs_type: fs_type.to_string(),
+            mount_point: guest_mount_path.to_string(),
+            options: vec!["ro".to_string()],
+            ..Default::default()
+        };
+
+        Self {
+            guest_path: guest_mount_path.to_string(),
+            device_id: format!("preattached-{cid}"),
+            mount: oci::Mount::default(),
+            storage: Some(storage),
+        }
+    }
 }
 
 #[async_trait]

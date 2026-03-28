@@ -146,12 +146,23 @@ impl RootFsResource {
                     };
                     Ok(share_rootfs)
                 } else if layer.fs_type == TYPE_OVERLAY_FS {
-                    // No shared filesystem available (e.g., template restore with
-                    // shared_fs=none). Convert the overlay rootfs to an erofs image
-                    // and hot-plug it as a read-only block device. This avoids
-                    // virtio-fs entirely, which is incompatible with VM snapshot
-                    // restore (both vhost-user reconnection and FUSE operations
-                    // hang with hot-added devices).
+                    // If the VM was restored from a per-image snapshot, the
+                    // container rootfs disk is already attached as /dev/vdb.
+                    // Skip erofs conversion and hot-plug entirely.
+                    if h.is_rootfs_preattached().await {
+                        let guest_rootfs_path = format!("/run/kata-rootfs/{cid}");
+                        let guest_device = "/dev/vdb";
+                        info!(sl!(), "rootfs preattached from image snapshot, using {}", guest_device);
+
+                        let block_rootfs: Arc<dyn Rootfs> = Arc::new(
+                            block_rootfs::BlockRootfs::new_preattached(
+                                cid, guest_device, &guest_rootfs_path, "erofs",
+                            ),
+                        );
+                        inner.rootfs.push(block_rootfs.clone());
+                        return Ok(block_rootfs);
+                    }
+
                     info!(sl!(), "converting overlay rootfs to erofs block device");
 
                     let rootfs_path = std::path::Path::new(bundle_path).join(ROOTFS);
@@ -186,36 +197,12 @@ impl RootFsResource {
 
                     let guest_rootfs_path = format!("/run/kata-rootfs/{cid}");
 
-                    // Try to use a pre-attached rootfs slot to avoid PCI
-                    // hot-plug latency (~124ms). Falls back to hot-plug if
-                    // no slots are available.
-                    if let Some((_disk_id, guest_device_path)) = h.allocate_rootfs_slot().await {
-                        info!(
-                            sl!(),
-                            "using pre-attached rootfs slot";
-                            "guest_device" => &guest_device_path,
-                            "erofs_path" => erofs_path.display().to_string(),
-                        );
-
-                        let block_rootfs: Arc<dyn Rootfs> = Arc::new(
-                            block_rootfs::BlockRootfs::new_preattached(
-                                cid,
-                                &guest_device_path,
-                                &guest_rootfs_path,
-                                "erofs",
-                            ),
-                        );
-                        Ok(block_rootfs)
-                    } else {
-                        // Fallback: hot-plug the erofs image as a new block device.
-                        info!(sl!(), "no pre-attached slots, falling back to hot-plug");
-
-                        let erofs_mount = Mount {
-                            source: erofs_path.to_string_lossy().to_string(),
-                            fs_type: "erofs".to_string(),
-                            options: vec!["ro".to_string()],
-                            ..Default::default()
-                        };
+                    let erofs_mount = Mount {
+                        source: erofs_path.to_string_lossy().to_string(),
+                        fs_type: "erofs".to_string(),
+                        options: vec!["ro".to_string()],
+                        ..Default::default()
+                    };
 
                         let fstat = nix::sys::stat::stat(erofs_path.to_str().unwrap())
                             .context("stat erofs image")?;
@@ -232,7 +219,6 @@ impl RootFsResource {
                             .context("new erofs block rootfs")?,
                         );
                         Ok(block_rootfs)
-                    }
                 } else {
                     Err(anyhow!("unsupported rootfs {:?}", &layer))
                 }?;

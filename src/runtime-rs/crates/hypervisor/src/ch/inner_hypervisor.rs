@@ -599,6 +599,35 @@ impl CloudHypervisorInner {
         selinux_label: Option<String>,
     ) -> Result<()> {
         self.id = id.to_string();
+
+        // For pool VMs, the VM is already running. Create symlinks from the
+        // sandbox-specific paths to the pool VM's actual socket paths so the
+        // agent connection code finds them.
+        if self.pool_vm_ready {
+            let sandbox_path = get_sandbox_path(id);
+            let pool_vm_path = &self.vm_path;
+
+            create_dir_all_with_inherit_owner(&sandbox_path, 0o750)
+                .with_context(|| format!("create sandbox dir {}", sandbox_path))?;
+            create_dir_all_with_inherit_owner(&format!("{sandbox_path}/root"), 0o750)
+                .with_context(|| format!("create sandbox root dir"))?;
+
+            // Symlink vsock and API sockets
+            for name in &["ch-vm.sock", "ch-api.sock"] {
+                let target = format!("{pool_vm_path}/{name}");
+                let link = format!("{sandbox_path}/{name}");
+                if !Path::new(&link).exists() && Path::new(&target).exists() {
+                    std::os::unix::fs::symlink(&target, &link)
+                        .with_context(|| format!("symlink {} -> {}", link, target))?;
+                }
+            }
+
+            self.vm_path = sandbox_path.clone();
+            self.run_dir = sandbox_path;
+            self.netns = netns;
+            return Ok(());
+        }
+
         self.state = VmmState::NotReady;
 
         self.setup_environment().await?;
@@ -680,6 +709,14 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn start_vm(&mut self, timeout_secs: i32) -> Result<()> {
+        // Pool VMs are already restored, resumed, and agent-ready.
+        // Just set the state and return.
+        if self.pool_vm_ready {
+            info!(sl!(), "pool VM already running, skipping start_vm");
+            self.state = VmmState::VmRunning;
+            return Ok(());
+        }
+
         self.timeout_secs = timeout_secs;
         self.start_hypervisor(self.timeout_secs).await?;
 

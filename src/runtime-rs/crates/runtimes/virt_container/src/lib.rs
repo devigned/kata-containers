@@ -23,6 +23,17 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use common::{message::Message, types::SandboxConfig, RuntimeHandler, RuntimeInstance};
 use hypervisor::Hypervisor;
+
+/// Rootfs mount info set by handler_task_message before new_instance.
+/// Protected by the runtime instance initialization guard (only one
+/// sandbox initializes at a time per shim process).
+static PENDING_ROOTFS: std::sync::Mutex<Option<Vec<kata_types::mount::Mount>>> =
+    std::sync::Mutex::new(None);
+
+/// Set pending rootfs mounts for the next pool acquire call.
+pub fn set_pending_rootfs(mounts: Vec<kata_types::mount::Mount>) {
+    *PENDING_ROOTFS.lock().unwrap() = Some(mounts);
+}
 #[cfg(feature = "dragonball")]
 use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
@@ -108,8 +119,9 @@ impl RuntimeHandler for VirtContainer {
         sandbox_config: SandboxConfig,
     ) -> Result<RuntimeInstance> {
         let factory = config.get_factory();
+        let rootfs_mounts = PENDING_ROOTFS.lock().unwrap().take();
         let (hypervisor, agent) = if factory.enable_template {
-            build_vm_from_template()
+            build_vm_from_template(rootfs_mounts.as_deref())
                 .await
                 .context("build vm from template")?
         } else {
@@ -161,10 +173,31 @@ impl RuntimeHandler for VirtContainer {
     }
 }
 
-async fn build_vm_from_template() -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
+async fn build_vm_from_template(
+    rootfs_mounts: Option<&[kata_types::mount::Mount]>,
+) -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
     let (mut toml_config, _) =
         TomlConfig::load_from_default().context("failed to load toml config")?;
     let hypervisor_name = toml_config.runtime.hypervisor_name.clone();
+
+    // Try acquiring a pre-warmed VM from the pool daemon.
+    #[cfg(all(
+        feature = "cloud-hypervisor",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if hypervisor_name == HYPERVISOR_NAME_CH {
+        const POOL_SOCKET: &str = "/run/kata/pool.sock";
+        if std::path::Path::new(POOL_SOCKET).exists() {
+            match acquire_from_pool(POOL_SOCKET, &toml_config, rootfs_mounts).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    info!(sl!(), "pool acquire failed, falling back to direct restore: {}", e);
+                }
+            }
+        }
+    }
+
+    // Fallback: direct restore from template
     if let Some(h) = toml_config.hypervisor.get_mut(&hypervisor_name) {
         h.vm_template.boot_to_be_template = false;
         h.vm_template.boot_from_template = true;
@@ -181,6 +214,129 @@ async fn build_vm_from_template() -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>
     let agent = new_agent(&toml_config).context("new agent")? as Arc<dyn agent::Agent>;
 
     Ok((hypervisor, agent))
+}
+
+/// Acquire a pre-warmed VM from the pool daemon.
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+async fn acquire_from_pool(
+    pool_socket: &str,
+    toml_config: &TomlConfig,
+    rootfs_mounts: Option<&[kata_types::mount::Mount]>,
+) -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
+    use kata_sys_util::mount::Mounter;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    // Compute erofs path + image key from rootfs mounts so the pool daemon
+    // can check its per-image snapshot cache.
+    let mut image_key: Option<String> = None;
+    let mut erofs_path: Option<String> = None;
+
+    if let Some(mounts) = rootfs_mounts {
+        if let Some(layer) = mounts.first() {
+            if layer.fs_type == "overlay" {
+                let probe_path = std::path::PathBuf::from(format!(
+                    "/tmp/kata-erofs-probe-{}", std::process::id()
+                ));
+                let _ = std::fs::create_dir_all(&probe_path);
+                if layer.mount(&probe_path).is_ok() {
+                    let mut key_material = layer.source.clone();
+                    if !layer.options.is_empty() {
+                        key_material.push('|');
+                        key_material.push_str(&layer.options.join(","));
+                    }
+                    let cache_key = resource::rootfs::erofs_rootfs::stable_cache_key(&key_material);
+                    if let Ok(path) = resource::rootfs::erofs_rootfs::prepare_erofs(&probe_path, &cache_key) {
+                        erofs_path = Some(path.to_string_lossy().to_string());
+                    }
+                    let _ = nix::mount::umount(&probe_path);
+                }
+
+                // Use the lowerdir path as a stable image key — it contains
+                // the containerd snapshot ID which is stable per image layer.
+                // Extract lowerdir from mount options: "lowerdir=/path/to/snap/fs"
+                for opt in &layer.options {
+                    if let Some(lower) = opt.strip_prefix("lowerdir=") {
+                        image_key = Some(resource::rootfs::erofs_rootfs::stable_cache_key(lower));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut stream = UnixStream::connect(pool_socket)
+        .await
+        .context("connect to pool daemon")?;
+
+    // Send acquire request with image info for snapshot cache lookup
+    let mut req = serde_json::json!({"action": "acquire"});
+    if let Some(ref key) = image_key {
+        req["image_key"] = serde_json::Value::String(key.clone());
+    }
+    if let Some(ref path) = erofs_path {
+        req["erofs_path"] = serde_json::Value::String(path.clone());
+    }
+    let mut req_bytes = serde_json::to_vec(&req)?;
+    req_bytes.push(b'\n');
+    stream.write_all(&req_bytes).await.context("send acquire")?;
+
+    // Read response
+    let mut reader = BufReader::new(&mut stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .await
+        .context("read pool response")?;
+
+    let vm: serde_json::Value =
+        serde_json::from_str(&response).context("parse pool response")?;
+
+    if let Some(error) = vm.get("error") {
+        return Err(anyhow!("pool error: {}", error));
+    }
+
+    let api_socket = vm["api_socket"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing api_socket"))?;
+    let vsock_socket = vm["vsock_socket"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing vsock_socket"))?;
+    let ch_pid = vm["ch_pid"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("missing ch_pid"))? as u32;
+    let vm_id = vm["vm_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing vm_id"))?;
+    let rootfs_preattached = vm["rootfs_preattached"].as_bool().unwrap_or(false);
+
+    info!(
+        sl!(),
+        "acquired pool VM: {} (PID={}, preattached={})", vm_id, ch_pid, rootfs_preattached
+    );
+
+    // Create CH hypervisor from pool VM
+    let hypervisor_config = toml_config
+        .hypervisor
+        .get(HYPERVISOR_NAME_CH)
+        .cloned()
+        .unwrap_or_default();
+
+    let hypervisor = CloudHypervisor::new();
+    hypervisor
+        .set_hypervisor_config(hypervisor_config)
+        .await;
+    hypervisor
+        .init_from_pool(api_socket, vsock_socket, ch_pid, vm_id, rootfs_preattached)
+        .await
+        .context("init CH from pool")?;
+
+    let agent = new_agent(toml_config).context("new agent")? as Arc<dyn agent::Agent>;
+
+    Ok((Arc::new(hypervisor), agent))
 }
 
 async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>> {
