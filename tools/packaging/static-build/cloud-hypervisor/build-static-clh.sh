@@ -24,6 +24,13 @@ cloud_hypervisor_version="${cloud_hypervisor_version:-}"
 cloud_hypervisor_pr="${cloud_hypervisor_pr:-}"
 cloud_hypervisor_pull_ref_branch="${cloud_hypervisor_pull_ref_branch:-main}"
 
+# To build CH with OnDemand memory restore support (userfaultfd demand-paged
+# snapshot restore, CH PR #7800), build from a main branch commit post-merge:
+#   force_build_from_source=true \
+#   cloud_hypervisor_version=57e766bdbbfcdf1f36f696fc735fbebbea97f5ca \
+#   ./build-static-clh.sh
+# This feature is required for Kata's VM template fast-restore path.
+
 if [ -z "$cloud_hypervisor_repo" ]; then
 	info "Get cloud_hypervisor information from runtime versions.yaml"
 	cloud_hypervisor_url=$(get_from_kata_deps ".assets.hypervisor.cloud_hypervisor.url")

@@ -23,6 +23,17 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use common::{message::Message, types::SandboxConfig, RuntimeHandler, RuntimeInstance};
 use hypervisor::Hypervisor;
+
+/// Rootfs mount info set by handler_task_message before new_instance.
+/// Protected by the runtime instance initialization guard (only one
+/// sandbox initializes at a time per shim process).
+static PENDING_ROOTFS: std::sync::Mutex<Option<Vec<kata_types::mount::Mount>>> =
+    std::sync::Mutex::new(None);
+
+/// Set pending rootfs mounts for the next pool acquire call.
+pub fn set_pending_rootfs(mounts: Vec<kata_types::mount::Mount>) {
+    *PENDING_ROOTFS.lock().unwrap() = Some(mounts);
+}
 #[cfg(feature = "dragonball")]
 use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
@@ -108,8 +119,9 @@ impl RuntimeHandler for VirtContainer {
         sandbox_config: SandboxConfig,
     ) -> Result<RuntimeInstance> {
         let factory = config.get_factory();
+        let rootfs_mounts = PENDING_ROOTFS.lock().unwrap().take();
         let (hypervisor, agent) = if factory.enable_template {
-            build_vm_from_template()
+            build_vm_from_template(rootfs_mounts.as_deref())
                 .await
                 .context("build vm from template")?
         } else {
@@ -161,10 +173,31 @@ impl RuntimeHandler for VirtContainer {
     }
 }
 
-async fn build_vm_from_template() -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
+async fn build_vm_from_template(
+    rootfs_mounts: Option<&[kata_types::mount::Mount]>,
+) -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
     let (mut toml_config, _) =
         TomlConfig::load_from_default().context("failed to load toml config")?;
     let hypervisor_name = toml_config.runtime.hypervisor_name.clone();
+
+    // Try acquiring a pre-warmed VM from the pool daemon.
+    #[cfg(all(
+        feature = "cloud-hypervisor",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if hypervisor_name == HYPERVISOR_NAME_CH {
+        const POOL_SOCKET: &str = "/run/kata/pool.sock";
+        if std::path::Path::new(POOL_SOCKET).exists() {
+            match acquire_from_pool(POOL_SOCKET, &toml_config, rootfs_mounts).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    info!(sl!(), "pool acquire failed, falling back to direct restore: {}", e);
+                }
+            }
+        }
+    }
+
+    // Fallback: direct restore from template
     if let Some(h) = toml_config.hypervisor.get_mut(&hypervisor_name) {
         h.vm_template.boot_to_be_template = false;
         h.vm_template.boot_from_template = true;
@@ -181,6 +214,106 @@ async fn build_vm_from_template() -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>
     let agent = new_agent(&toml_config).context("new agent")? as Arc<dyn agent::Agent>;
 
     Ok((hypervisor, agent))
+}
+
+/// Acquire a pre-warmed VM from the pool daemon.
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+async fn acquire_from_pool(
+    pool_socket: &str,
+    toml_config: &TomlConfig,
+    rootfs_mounts: Option<&[kata_types::mount::Mount]>,
+) -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
+    use kata_sys_util::mount::Mounter;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    // Compute erofs path (cache check first, no mount if cached)
+    let mut erofs_path = String::new();
+    if let Some(mounts) = rootfs_mounts {
+        if let Some(layer) = mounts.first() {
+            if layer.fs_type == "overlay" {
+                let mut key_material = layer.source.clone();
+                if !layer.options.is_empty() {
+                    key_material.push('|');
+                    key_material.push_str(&layer.options.join(","));
+                }
+                let cache_key = resource::rootfs::erofs_rootfs::stable_cache_key(&key_material);
+                let cache_file = std::path::PathBuf::from("/run/vc/erofs-cache")
+                    .join(format!("{cache_key}.erofs"));
+
+                if cache_file.exists() {
+                    erofs_path = cache_file.to_string_lossy().to_string();
+                } else {
+                    let probe_path = std::path::PathBuf::from(format!(
+                        "/tmp/kata-erofs-probe-{}", std::process::id()
+                    ));
+                    let _ = std::fs::create_dir_all(&probe_path);
+                    if layer.mount(&probe_path).is_ok() {
+                        if let Ok(path) = resource::rootfs::erofs_rootfs::prepare_erofs(&probe_path, &cache_key) {
+                            erofs_path = path.to_string_lossy().to_string();
+                        }
+                        let _ = nix::mount::umount(&probe_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Send run_container to daemon — it acquires a VM, hot-plugs erofs,
+    // and runs create_sandbox + create_container via the agent.
+    // This eliminates ~200ms of shim-side work (sandbox.start + create_container).
+    let mut stream = UnixStream::connect(pool_socket)
+        .await
+        .context("connect to pool daemon")?;
+
+    let req = serde_json::json!({
+        "action": "run_container",
+        "erofs_path": erofs_path,
+        "container_id": "default",
+        "sandbox_id": "default",
+    });
+    let mut req_bytes = serde_json::to_vec(&req)?;
+    req_bytes.push(b'\n');
+    stream.write_all(&req_bytes).await.context("send run_container")?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).await.context("read response")?;
+
+    let vm: serde_json::Value = serde_json::from_str(&response).context("parse response")?;
+    if let Some(error) = vm.get("error") {
+        return Err(anyhow!("daemon error: {}", error));
+    }
+
+    let api_socket = vm["api_socket"].as_str().ok_or_else(|| anyhow!("missing api_socket"))?;
+    let vsock_socket = vm["vsock_socket"].as_str().ok_or_else(|| anyhow!("missing vsock_socket"))?;
+    let ch_pid = vm["ch_pid"].as_u64().ok_or_else(|| anyhow!("missing ch_pid"))? as u32;
+    let vm_id = vm["vm_id"].as_str().ok_or_else(|| anyhow!("missing vm_id"))?;
+
+    info!(sl!(), "daemon ran container in VM {} (PID={})", vm_id, ch_pid);
+
+    // Create hypervisor wrapper for lifecycle tracking.
+    // sandbox.start() and create_container() will be no-ops since the
+    // daemon already did the work.
+    let hypervisor_config = toml_config
+        .hypervisor
+        .get(HYPERVISOR_NAME_CH)
+        .cloned()
+        .unwrap_or_default();
+
+    let hypervisor = CloudHypervisor::new();
+    hypervisor.set_hypervisor_config(hypervisor_config).await;
+    hypervisor
+        .init_from_pool(api_socket, vsock_socket, ch_pid, vm_id, false)
+        .await
+        .context("init CH from pool")?;
+
+    let agent = new_agent(toml_config).context("new agent")? as Arc<dyn agent::Agent>;
+
+    Ok((Arc::new(hypervisor), agent))
 }
 
 async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>> {

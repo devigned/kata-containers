@@ -50,6 +50,34 @@ impl CloudHypervisor {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
+
+    /// Initialize from a pre-warmed pool VM.
+    ///
+    /// The VM is already restored, resumed, and agent-ready. We just need
+    /// to set up the inner state so start_vm() is a no-op and the API
+    /// socket is connected for device hot-plug operations.
+    pub async fn init_from_pool(
+        &self,
+        api_socket_path: &str,
+        vsock_socket_path: &str,
+        ch_pid: u32,
+        pool_vm_id: &str,
+        rootfs_preattached: bool,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.write().await;
+
+        let api_socket = std::os::unix::net::UnixStream::connect(api_socket_path)
+            .map_err(|e| anyhow::anyhow!("connect to pool VM API socket: {}", e))?;
+        inner.api_socket = Some(api_socket);
+        inner.pid = Some(ch_pid);
+        inner.vm_path = format!("/run/kata/pool/{pool_vm_id}");
+        inner.run_dir = inner.vm_path.clone();
+        inner.pool_vm_ready = true;
+        inner.rootfs_preattached = rootfs_preattached;
+        inner.state = crate::VmmState::VmRunning;
+
+        Ok(())
+    }
 }
 
 impl Default for CloudHypervisor {
@@ -93,12 +121,12 @@ impl Hypervisor for CloudHypervisor {
 
     async fn pause_vm(&self) -> Result<()> {
         let inner = self.inner.write().await;
-        inner.pause_vm()
+        inner.pause_vm().await
     }
 
     async fn resume_vm(&self) -> Result<()> {
         let inner = self.inner.write().await;
-        inner.resume_vm()
+        inner.resume_vm().await
     }
 
     async fn save_vm(&self) -> Result<()> {
@@ -212,6 +240,14 @@ impl Hypervisor for CloudHypervisor {
 
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
         Err(anyhow::anyhow!("Not yet supported"))
+    }
+
+    async fn is_rootfs_preattached(&self) -> bool {
+        self.inner.read().await.rootfs_preattached
+    }
+
+    async fn is_pool_vm(&self) -> bool {
+        self.inner.read().await.pool_vm_ready
     }
 }
 

@@ -247,3 +247,82 @@ pub async fn cloud_hypervisor_vm_resize(
     })
     .await?
 }
+
+pub async fn cloud_hypervisor_vm_pause(mut socket: UnixStream) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(&mut socket, "PUT", "vm.pause", None)
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}
+
+pub async fn cloud_hypervisor_vm_resume(mut socket: UnixStream) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(&mut socket, "PUT", "vm.resume", None)
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}
+
+/// Configuration for VM snapshot.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct VmSnapshotConfig {
+    pub destination_url: String,
+}
+
+/// Configuration for VM restore.
+///
+/// The `memory_restore_mode` field controls how guest memory is populated from the
+/// snapshot. When set to `"OnDemand"`, Cloud Hypervisor uses `userfaultfd` to lazily
+/// fault pages in on first access rather than eagerly copying the entire snapshot.
+/// This requires a Cloud Hypervisor build from the `main` branch (post PR #7800).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct RestoreConfig {
+    pub source_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefault: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_restore_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<bool>,
+}
+
+pub async fn cloud_hypervisor_vm_snapshot(
+    mut socket: UnixStream,
+    snapshot_config: VmSnapshotConfig,
+) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(
+            &mut socket,
+            "PUT",
+            "vm.snapshot",
+            Some(&serde_json::to_string(&snapshot_config)?),
+        )
+        .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}
+
+pub async fn cloud_hypervisor_vm_restore(
+    mut socket: UnixStream,
+    restore_config: RestoreConfig,
+) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(
+            &mut socket,
+            "PUT",
+            "vm.restore",
+            Some(&serde_json::to_string(&restore_config)?),
+        )
+        .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}

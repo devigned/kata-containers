@@ -20,8 +20,10 @@ use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
 use ch_config::{
     ch_api::{
-        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
-        cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping, cloud_hypervisor_vmm_shutdown,
+        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_pause,
+        cloud_hypervisor_vm_resize, cloud_hypervisor_vm_restore, cloud_hypervisor_vm_resume,
+        cloud_hypervisor_vm_snapshot, cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping,
+        cloud_hypervisor_vmm_shutdown, RestoreConfig, VmSnapshotConfig,
     },
     VmResize,
 };
@@ -597,6 +599,35 @@ impl CloudHypervisorInner {
         selinux_label: Option<String>,
     ) -> Result<()> {
         self.id = id.to_string();
+
+        // For pool VMs, the VM is already running. Create symlinks from the
+        // sandbox-specific paths to the pool VM's actual socket paths so the
+        // agent connection code finds them.
+        if self.pool_vm_ready {
+            let sandbox_path = get_sandbox_path(id);
+            let pool_vm_path = &self.vm_path;
+
+            create_dir_all_with_inherit_owner(&sandbox_path, 0o750)
+                .with_context(|| format!("create sandbox dir {}", sandbox_path))?;
+            create_dir_all_with_inherit_owner(&format!("{sandbox_path}/root"), 0o750)
+                .with_context(|| format!("create sandbox root dir"))?;
+
+            // Symlink vsock and API sockets
+            for name in &["ch-vm.sock", "ch-api.sock"] {
+                let target = format!("{pool_vm_path}/{name}");
+                let link = format!("{sandbox_path}/{name}");
+                if !Path::new(&link).exists() && Path::new(&target).exists() {
+                    std::os::unix::fs::symlink(&target, &link)
+                        .with_context(|| format!("symlink {} -> {}", link, target))?;
+                }
+            }
+
+            self.vm_path = sandbox_path.clone();
+            self.run_dir = sandbox_path;
+            self.netns = netns;
+            return Ok(());
+        }
+
         self.state = VmmState::NotReady;
 
         self.setup_environment().await?;
@@ -678,12 +709,29 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn start_vm(&mut self, timeout_secs: i32) -> Result<()> {
+        // Pool VMs are already restored, resumed, and agent-ready.
+        // Just set the state and return.
+        if self.pool_vm_ready {
+            info!(sl!(), "pool VM already running, skipping start_vm");
+            self.state = VmmState::VmRunning;
+            return Ok(());
+        }
+
         self.timeout_secs = timeout_secs;
         self.start_hypervisor(self.timeout_secs).await?;
 
         self.state = VmmState::VmmServerReady;
 
-        self.boot_vm().await?;
+        if self.config.vm_template.boot_from_template {
+            // Restore from a snapshot instead of booting fresh.
+            // CH's vm.restore creates the VM from the snapshot (no vm.create needed).
+            // The snapshot contains no virtio-fs device — container rootfs is
+            // delivered as erofs block devices hot-plugged after restore.
+            self.restore_vm().await?;
+            self.resume_vm().await?;
+        } else {
+            self.boot_vm().await?;
+        }
 
         self.state = VmmState::VmRunning;
 
@@ -712,16 +760,190 @@ impl CloudHypervisorInner {
         Ok(0)
     }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
+    pub(crate) async fn pause_vm(&self) -> Result<()> {
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        let response =
+            cloud_hypervisor_vm_pause(socket.try_clone().context("failed to clone socket")?)
+                .await
+                .context("failed to pause VM")?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "vm pause response: {:?}", detail);
+        }
+
         Ok(())
     }
 
-    pub(crate) fn resume_vm(&self) -> Result<()> {
+    pub(crate) async fn resume_vm(&self) -> Result<()> {
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        let response =
+            cloud_hypervisor_vm_resume(socket.try_clone().context("failed to clone socket")?)
+                .await
+                .context("failed to resume VM")?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "vm resume response: {:?}", detail);
+        }
+
         Ok(())
     }
 
     pub(crate) async fn save_vm(&self) -> Result<()> {
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        // The device_state_path points to <template_dir>/state.
+        // CH's vm.snapshot writes into a directory, so use the parent (template_dir).
+        let snapshot_dir = Path::new(&self.config.vm_template.device_state_path)
+            .parent()
+            .ok_or_else(|| anyhow!("invalid device_state_path for snapshot"))?;
+
+        let snapshot_config = VmSnapshotConfig {
+            destination_url: format!("file://{}", snapshot_dir.display()),
+        };
+
+        info!(
+            sl!(),
+            "snapshotting VM to {:?}", snapshot_config.destination_url
+        );
+
+        cloud_hypervisor_vm_snapshot(
+            socket.try_clone().context("failed to clone socket")?,
+            snapshot_config,
+        )
+        .await
+        .context("failed to snapshot VM")?;
+
         Ok(())
+    }
+
+    /// Restore a VM from a snapshot using OnDemand memory restore mode.
+    ///
+    /// This uses Cloud Hypervisor's `userfaultfd`-based demand paging to lazily
+    /// fault snapshot pages in on first access, avoiding the cost of eagerly
+    /// copying the entire memory-ranges file into guest RAM.
+    ///
+    /// The snapshot's `config.json` records sandbox-specific socket paths from
+    /// the template creation. Before restoring, we patch these paths to point
+    /// to the current sandbox's paths so that vsock and CH API socket
+    /// connections work correctly.
+    pub(crate) async fn restore_vm(&mut self) -> Result<()> {
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        let snapshot_dir = Path::new(&self.config.vm_template.device_state_path)
+            .parent()
+            .ok_or_else(|| anyhow!("invalid device_state_path for restore"))?;
+
+        // Create a per-sandbox copy of the snapshot directory so we can patch
+        // config.json without corrupting the shared template for other VMs.
+        // Clean any stale dir from a previous attempt to avoid EEXIST on symlink.
+        let sandbox_path = get_sandbox_path(&self.id);
+        let restore_dir = Path::new(&sandbox_path).join("snapshot");
+        if restore_dir.exists() {
+            let _ = fs::remove_dir_all(&restore_dir);
+        }
+        fs::create_dir_all(&restore_dir)
+            .context("failed to create per-sandbox snapshot directory")?;
+
+        // Copy snapshot files (config.json, state.json are small; memory-ranges
+        // is large but CH reads it via the source_url path, so we only need to
+        // copy config.json and state.json, then symlink memory-ranges).
+        for name in &["config.json", "state.json"] {
+            fs::copy(snapshot_dir.join(name), restore_dir.join(name))
+                .with_context(|| format!("failed to copy {name} to restore dir"))?;
+        }
+        std::os::unix::fs::symlink(
+            snapshot_dir.join("memory-ranges"),
+            restore_dir.join("memory-ranges"),
+        )
+        .context("failed to symlink memory-ranges to restore dir")?;
+
+        // Patch the COPY of config.json with current sandbox paths.
+        let config_path = restore_dir.join("config.json");
+        let config_content = fs::read_to_string(&config_path)
+            .context("failed to read snapshot config.json")?;
+
+        let patched_content = Self::patch_snapshot_config(&config_content, &sandbox_path)?;
+
+        if patched_content != config_content {
+            fs::write(&config_path, &patched_content)
+                .context("failed to write patched config.json")?;
+            info!(
+                sl!(),
+                "patched snapshot config.json with current sandbox path"
+            );
+        }
+
+        let restore_config = RestoreConfig {
+            source_url: format!("file://{}", restore_dir.display()),
+            prefault: None,
+            memory_restore_mode: Some("OnDemand".to_string()),
+            resume: None,
+        };
+
+        info!(
+            sl!(),
+            "restoring VM from {:?} with OnDemand memory restore mode",
+            restore_config.source_url
+        );
+
+        cloud_hypervisor_vm_restore(
+            socket.try_clone().context("failed to clone socket")?,
+            restore_config,
+        )
+        .await
+        .context("failed to restore VM with OnDemand memory restore mode")?;
+
+        Ok(())
+    }
+
+    /// Patch a CH snapshot config.json to replace socket paths from the template
+    /// sandbox with paths for the current sandbox.
+    fn patch_snapshot_config(config_json: &str, current_sandbox_path: &str) -> Result<String> {
+        let config: serde_json::Value =
+            serde_json::from_str(config_json).context("failed to parse config.json")?;
+
+        // Extract the old sandbox path from the vsock socket path
+        let old_sandbox_path = config
+            .pointer("/vsock/socket")
+            .and_then(|v| v.as_str())
+            .and_then(|socket_path| {
+                Path::new(socket_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+            });
+
+        if let Some(old_path) = old_sandbox_path {
+            if old_path == current_sandbox_path {
+                return Ok(config_json.to_string());
+            }
+
+            // Replace all occurrences of the old sandbox path with the new one
+            let patched = config_json.replace(&old_path, current_sandbox_path);
+            // Validate the result is still valid JSON
+            let _: serde_json::Value =
+                serde_json::from_str(&patched).context("patched config.json is invalid JSON")?;
+            Ok(patched)
+        } else {
+            Ok(config_json.to_string())
+        }
     }
 
     pub(crate) async fn get_agent_socket(&self) -> Result<String> {

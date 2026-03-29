@@ -41,6 +41,8 @@ use tracing::{instrument, span};
 mod confidential_data_hub;
 mod config;
 mod console;
+#[cfg(feature = "crun")]
+pub(crate) mod crun;
 mod device;
 mod features;
 mod initdata;

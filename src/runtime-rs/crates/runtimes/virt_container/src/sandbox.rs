@@ -602,14 +602,20 @@ impl Sandbox for VirtSandbox {
 
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
-        let resources = self
-            .prepare_for_start_sandbox(id, sandbox_config.network_env.clone())
-            .await?;
+        // For pool VMs, the VM already has its devices (vsock, disk) from
+        // the snapshot. Skip device setup to avoid "too many devices" errors.
+        let is_pool_vm = self.hypervisor.is_pool_vm().await;
 
-        self.resource_manager
-            .prepare_before_start_vm(resources)
-            .await
-            .context("set up device before start vm")?;
+        if !is_pool_vm {
+            let resources = self
+                .prepare_for_start_sandbox(id, sandbox_config.network_env.clone())
+                .await?;
+
+            self.resource_manager
+                .prepare_before_start_vm(resources)
+                .await
+                .context("set up device before start vm")?;
+        }
 
         // start vm
         self.hypervisor.start_vm(10_000).await.context("start vm")?;

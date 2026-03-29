@@ -1,0 +1,15 @@
+[package]
+name = "kata-vm-pool"
+version = "0.1.0"
+edition = "2021"
+description = "Pre-warmed VM pool daemon for Kata Containers with CH OnDemand restore"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
